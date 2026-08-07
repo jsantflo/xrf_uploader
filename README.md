@@ -8,13 +8,20 @@ Parses XRF instrument `.txt` exports, generates per-sample Excel reports, and up
 pip install -r requirements.txt
 ```
 
-Add your Benchling API key to `dat/secrets.json`:
+Create a `dat/` directory and add your Benchling API key:
 
+```bash
+mkdir -p dat
+```
+
+`dat/secrets.json`:
 ```json
 {"AUTHOR_API_KEY": "your_api_key_here"}
 ```
 
-Or set the environment variable `BENCHLING_API_KEY` instead.
+`dat/` is gitignored — this file will never be committed.
+
+Alternatively, set the environment variable `BENCHLING_API_KEY` instead.
 
 ## Usage
 
