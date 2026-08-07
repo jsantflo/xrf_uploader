@@ -1,0 +1,15 @@
+# Secrets — never commit
+dat/
+
+# Generated output (but not the template at root)
+Excel Files/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
