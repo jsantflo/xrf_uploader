@@ -917,7 +917,7 @@ def upload_xrf_results(
         return {"dry_run": True}
 
     # Upload xlsx report as the summary blob
-    blob = benchling.blobs.create_from_file(str(xlsx_path))
+    blob = benchling.blobs.create_from_file(xlsx_path)
 
     # Concentration results — skip No Signal rows (no dropdown option exists)
     conc_creates = []
