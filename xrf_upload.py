@@ -1053,15 +1053,16 @@ def upload_xrf_from_txt(
             disp = r["display_conc"]
             print(f"    {elem:4s}: {str(disp):>20s}  [{r['quality']}]")
 
-        xlsx_path = generate_xlsx_report(
-            sample_name, cal_signals, raw_signals, all_elements, output_dir, run_date
-        )
-        print(f"  Report written: {xlsx_path}")
-
         entity_id = (entity_map or {}).get(sample_name)
 
+        # Compute the canonical base filename BEFORE generating the xlsx so that
+        # the duplicate check matches the blob name in Benchling even when the
+        # local file already exists and generate_xlsx_report appends " - 2", etc.
+        date_str = _format_run_date(run_date) if run_date else "unknown"
+        expected_filename = f"XRF Sample Report - {sample_name} - {date_str}.xlsx"
+
         if benchling is not None:
-            dupe = _check_duplicate(benchling, xlsx_path.name, entity_id=entity_id)
+            dupe = _check_duplicate(benchling, expected_filename, entity_id=entity_id)
             if dupe:
                 if dry_run:
                     print(f"  [DRY RUN] Existing upload found: {dupe['url']}")
@@ -1069,6 +1070,11 @@ def upload_xrf_from_txt(
                     print(f"  Duplicate detected — skipping. Existing result: {dupe['url']}")
                     all_results.append({"duplicate": True, "sample_name": sample_name, "url": dupe["url"]})
                     continue
+
+        xlsx_path = generate_xlsx_report(
+            sample_name, cal_signals, raw_signals, all_elements, output_dir, run_date
+        )
+        print(f"  Report written: {xlsx_path}")
 
         conc_rows, signal_rows = build_benchling_rows(sample_name, processed, raw_signals)
         # Filter signal rows to elements present in the template dropdown
