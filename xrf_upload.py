@@ -494,6 +494,7 @@ def process_sample(sample_signals: dict, calibration: dict) -> dict:
 
 TEMPLATE_PATH = pathlib.Path(__file__).parent / "XRF Sample Report - TEMPLATE.xlsx"
 
+
 # Caldat column mapping per standard: (std_index, elem_col_1indexed, signal_col_1indexed)
 _CALDAT_COLS = [
     (0,  1,  2),   # YP50-0: elem=A, signal=B
@@ -828,38 +829,97 @@ def _batches(items, size=100):
         yield items[i : i + size]
 
 
-def _check_duplicate(benchling, xlsx_filename: str, entity_id: str = None):
-    """Check for an existing summary result whose xlsx blob matches xlsx_filename.
-    Filters by entity_id when provided to avoid scanning all historical results.
-    Returns a dict {result_id, url} if found, otherwise None."""
-    list_kwargs = {"schema_id": XRF_SUMMARY_SCHEMA}
-    if entity_id:
-        list_kwargs["entity_ids"] = [entity_id]
+def _check_duplicate(benchling, sample_name: str, run_date: str, processed: dict, entity_id: str = None):
+    """Detect whether this exact measurement was already uploaded.
 
-    pairs = []
-    for page in benchling.assay_results.list(**list_kwargs):
+    Strategy:
+      1. Find any existing summary result for this entity whose blob name starts
+         with 'XRF Sample Report - <sample> - <date>' (same sample, same run date).
+         If none found → cannot be a duplicate.
+      2. Collect all existing concentration values for this entity from Benchling,
+         grouped by element dropdown ID.
+      3. Compare the new measurement element by element:
+           - All elements have a matching value in Benchling → duplicate (block).
+           - Any element has a new value                    → replicate (allow).
+    Returns {result_id, url} of the existing summary if duplicate, else None.
+    """
+    if entity_id is None:
+        return None
+
+    date_str = _format_run_date(run_date) if run_date else "unknown"
+    expected_base = f"XRF Sample Report - {sample_name} - {date_str}"
+
+    # Step 1: find any same-date summary result via blob name prefix
+    same_date_summary = None
+    for page in benchling.assay_results.list(
+        schema_id=XRF_SUMMARY_SCHEMA, entity_ids=[entity_id]
+    ):
         for r in page:
             if not r.fields:
                 continue
             field = r.fields.additional_properties.get(FIELD_SUM_REPORT)
             blob_id = getattr(field, "value", None)
-            if blob_id:
-                pairs.append((r.id, blob_id))
+            if not blob_id:
+                continue
+            try:
+                blob = benchling.blobs.get(blob_id)
+                if blob.name and blob.name.startswith(expected_base):
+                    same_date_summary = r
+            except Exception:
+                continue
+        if same_date_summary:
+            break
 
-    if not pairs:
+    if same_date_summary is None:
         return None
 
-    for result_id, blob_id in pairs:
-        try:
-            blob = benchling.blobs.get(blob_id)
-            if blob.name == xlsx_filename:
-                return {
-                    "result_id": result_id,
-                    "url": f"{BENCHLING_URL}/assay-results/{result_id}",
-                }
-        except Exception:
-            continue
-    return None
+    # Step 2: build new measurement  elem_dropdown_id → concentration
+    new_concs = {}
+    for elem, data in processed.items():
+        elem_id = CONC_ELEMENT_IDS.get(elem)
+        if elem_id and data.get("conc") is not None:
+            new_concs[elem_id] = float(data["conc"])
+
+    if not new_concs:
+        # No concentrations to compare — same-date summary is enough evidence
+        return {
+            "result_id": same_date_summary.id,
+            "url": f"{BENCHLING_URL}/assay-results/{same_date_summary.id}",
+        }
+
+    # Step 3: collect ALL existing concentration values for this entity
+    # grouped by element dropdown ID (no timestamp filtering — avoids tz issues)
+    existing_by_elem = {}  # elem_dropdown_id → set of float values
+    for page in benchling.assay_results.list(
+        schema_id=XRF_CONCENTRATION_SCHEMA, entity_ids=[entity_id]
+    ):
+        for r in page:
+            if not r.fields:
+                continue
+            fm = r.fields.additional_properties
+            elem_field = fm.get(FIELD_CONC_ELEMENT)
+            val_field  = fm.get(FIELD_CONC_VALUE)
+            if elem_field and val_field and val_field.value is not None:
+                try:
+                    existing_by_elem.setdefault(elem_field.value, set()).add(
+                        float(val_field.value)
+                    )
+                except (TypeError, ValueError):
+                    pass
+
+    # Step 4: element-by-element comparison
+    # A value counts as "seen" if it matches any stored value within tolerance.
+    # If every new element value was already in Benchling → duplicate.
+    # If any value is absent → it's a replicate measurement.
+    for elem_id, new_val in new_concs.items():
+        existing_vals = existing_by_elem.get(elem_id, set())
+        if not any(abs(new_val - ev) <= 0.001 for ev in existing_vals):
+            return None  # new value found → replicate
+
+    return {
+        "result_id": same_date_summary.id,
+        "url": f"{BENCHLING_URL}/assay-results/{same_date_summary.id}",
+    }
 
 
 def find_entity_by_name(benchling, name: str):
@@ -1055,14 +1115,8 @@ def upload_xrf_from_txt(
 
         entity_id = (entity_map or {}).get(sample_name)
 
-        # Compute the canonical base filename BEFORE generating the xlsx so that
-        # the duplicate check matches the blob name in Benchling even when the
-        # local file already exists and generate_xlsx_report appends " - 2", etc.
-        date_str = _format_run_date(run_date) if run_date else "unknown"
-        expected_filename = f"XRF Sample Report - {sample_name} - {date_str}.xlsx"
-
         if benchling is not None:
-            dupe = _check_duplicate(benchling, expected_filename, entity_id=entity_id)
+            dupe = _check_duplicate(benchling, sample_name, run_date, processed, entity_id=entity_id)
             if dupe:
                 if dry_run:
                     print(f"  [DRY RUN] Existing upload found: {dupe['url']}")
