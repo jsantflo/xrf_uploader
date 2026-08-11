@@ -839,7 +839,9 @@ def _check_duplicate(benchling, xlsx_filename: str, entity_id: str = None):
     pairs = []
     for page in benchling.assay_results.list(**list_kwargs):
         for r in page:
-            field = (r.fields or {}).get(FIELD_SUM_REPORT)
+            if not r.fields:
+                continue
+            field = r.fields.additional_properties.get(FIELD_SUM_REPORT)
             blob_id = getattr(field, "value", None)
             if blob_id:
                 pairs.append((r.id, blob_id))
@@ -847,16 +849,16 @@ def _check_duplicate(benchling, xlsx_filename: str, entity_id: str = None):
     if not pairs:
         return None
 
-    # Bulk-fetch all matching blobs in one API call
-    blobs = benchling.blobs.bulk_get([p[1] for p in pairs])
-    blob_name_map = {b.id: b.name for b in blobs}
-
     for result_id, blob_id in pairs:
-        if blob_name_map.get(blob_id) == xlsx_filename:
-            return {
-                "result_id": result_id,
-                "url": f"{BENCHLING_URL}/assay-results/{result_id}",
-            }
+        try:
+            blob = benchling.blobs.get(blob_id)
+            if blob.name == xlsx_filename:
+                return {
+                    "result_id": result_id,
+                    "url": f"{BENCHLING_URL}/assay-results/{result_id}",
+                }
+        except Exception:
+            continue
     return None
 
 
