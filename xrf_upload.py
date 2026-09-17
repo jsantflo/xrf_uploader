@@ -17,15 +17,16 @@ import shutil
 import openpyxl
 from openpyxl.chart import ScatterChart, Reference, Series
 from openpyxl.styles import PatternFill
-from benchling_sdk.models import AssayResultCreate
+from benchling_sdk.models import AssayResultCreate, CustomEntityCreate
 from benchling_sdk.helpers.serialization_helpers import fields as _fields
 
 # ---------------------------------------------------------------------------
 # Schema IDs
 # ---------------------------------------------------------------------------
-XRF_CONCENTRATION_SCHEMA = "assaysch_e7BnMa7Z" 
-XRF_SIGNAL_SCHEMA        = "assaysch_dHcQUAwe"
-XRF_SUMMARY_SCHEMA       = "assaysch_9LFkZwZL"
+XRF_CONCENTRATION_SCHEMA  = "assaysch_e7BnMa7Z"
+XRF_SIGNAL_SCHEMA         = "assaysch_dHcQUAwe"
+XRF_SUMMARY_SCHEMA        = "assaysch_9LFkZwZL"
+XRF_SAMPLE_ENTITY_SCHEMA  = "ts_AaxHMSKmtb"
 
 # Benchling URL prefix (no trailing slash)
 BENCHLING_URL = "https://florrent.benchling.com"
@@ -141,21 +142,28 @@ SIGNAL_QUALITY_IDS = {
 # Field name constants — update these to match your Benchling schema fields
 # ---------------------------------------------------------------------------
 # Concentration schema fields
-FIELD_CONC_SAMPLE   = "material" #tsf_lxSJeyHJ
-FIELD_CONC_ELEMENT  = "element" #tsf_SFX7VDa4
-FIELD_CONC_VALUE    = "concentration_ppm" #tsf_LA6zIgyH
-FIELD_CONC_QUALITY  = "signal_quality" #tsf_L8Y9TNIg
-#FIELD_CONC_LOD      = "lod"
+FIELD_CONC_SAMPLE      = "material" #tsf_lxSJeyHJ
+FIELD_CONC_XRF_SAMPLE  = "tsf_arvJejsK26"
+FIELD_CONC_ELEMENT     = "element" #tsf_SFX7VDa4
+FIELD_CONC_VALUE       = "concentration_ppm" #tsf_LA6zIgyH
+FIELD_CONC_QUALITY     = "signal_quality" #tsf_L8Y9TNIg
+#FIELD_CONC_LOD        = "lod"
 
 # Signal intensity schema fields
-FIELD_SIG_SAMPLE    = "material" #tsf_nKDnwU2L
-FIELD_SIG_ELEMENT   = "element" #tsf_Dv2603LU
-FIELD_SIG_VALUE     = "signal_intensity" #tsf_4vwG3S2p
+FIELD_SIG_SAMPLE       = "material" #tsf_nKDnwU2L
+FIELD_SIG_XRF_SAMPLE   = "tsf_iJoldp4Kju"
+FIELD_SIG_ELEMENT      = "element" #tsf_Dv2603LU
+FIELD_SIG_VALUE        = "signal_intensity" #tsf_4vwG3S2p
 
 # Summary schema fields
-FIELD_SUM_SAMPLE    = "material" #tsf_NYZy54Gv
-FIELD_SUM_REPORT    = "xrf_analysis_report_xlsx" #tsf_TL2VjurB
-#FIELD_SUM_DATE      = "date"
+FIELD_SUM_SAMPLE       = "material" #tsf_NYZy54Gv
+FIELD_SUM_XRF_SAMPLE   = "xrf_sample"         #tsf_1OoMxNc4oy
+FIELD_SUM_REPORT       = "xrf_analysis_report_xlsx" #tsf_TL2VjurB
+#FIELD_SUM_DATE        = "date"
+
+# XRF Sample entity fields
+XRF_FIELD_MATERIAL        = "tsf_A0GyhCxVmU"
+XRF_FIELD_SAMPLING_NUMBER = "tsf_mnrnPsTFgp"
 
 # ---------------------------------------------------------------------------
 # Calibrated-element configuration
@@ -232,6 +240,20 @@ YP50_TRUE_CONC = {
 
 CALIBRATION_STANDARDS = [f"YP50F-{i}" for i in range(7)]  # Ident prefixes in txt
 
+_REPLICATE_SUFFIX_RE = re.compile(r'^(.+?)\s+(\d+)$')
+
+
+def _parse_replicate_suffix(name: str):
+    """
+    Detect an inter-sample replicate suffix: a space followed by a plain integer.
+
+    'Char-001'   -> ('Char-001', None)   intra-sample / no suffix
+    'Char-001 2' -> ('Char-001', 2)      2nd distinct sampling of Char-001
+    """
+    m = _REPLICATE_SUFFIX_RE.match(name)
+    return (m.group(1), int(m.group(2))) if m else (name, None)
+
+
 # ---------------------------------------------------------------------------
 # 1. TXT PARSER
 # ---------------------------------------------------------------------------
@@ -299,7 +321,8 @@ def parse_xrf_txt(txt_path: pathlib.Path) -> dict:
         except (ValueError, AttributeError):
             return 0.0
 
-    samples = {}
+    samples = {}       # unique sample names → signals (for entity resolution)
+    sample_rows = []   # all rows in file order, as (ident, signals) tuples
     cal_sets = []
     current_set = {}
     current_set_stds = set()
@@ -337,12 +360,14 @@ def parse_xrf_txt(txt_path: pathlib.Path) -> dict:
                     break
         else:
             samples[ident] = signals
+            sample_rows.append((ident, signals))
 
     if current_set:
         cal_sets.append(current_set)
 
     return {
-        "samples":       samples,
+        "samples":       samples,       # dict: unique name → signals
+        "sample_rows":   sample_rows,   # list: all (name, signals) in file order
         "cal_standards": cal_sets[0] if cal_sets else {},
         "cal_sets":      cal_sets,
         "all_elements":  all_elements,
@@ -829,7 +854,8 @@ def _batches(items, size=100):
         yield items[i : i + size]
 
 
-def _check_duplicate(benchling, sample_name: str, run_date: str, processed: dict, entity_id: str = None):
+def _check_duplicate(benchling, sample_name: str, run_date: str, processed: dict,
+                     entity_id: str = None, xrf_entity_id: str = None):
     """Detect whether this exact measurement was already uploaded.
 
     Strategy:
@@ -841,42 +867,75 @@ def _check_duplicate(benchling, sample_name: str, run_date: str, processed: dict
       3. Compare the new measurement element by element:
            - All elements have a matching value in Benchling → duplicate (block).
            - Any element has a new value                    → replicate (allow).
+
+    xrf_entity_id — if provided, use it for server-side filtering (single-value
+                    entity field, avoids scanning all summary results).
+    entity_id     — material entity, used when xrf_entity_id is unavailable.
     Returns {result_id, url} of the existing summary if duplicate, else None.
     """
-    if entity_id is None:
+    if entity_id is None and xrf_entity_id is None:
         return None
 
     date_str = _format_run_date(run_date) if run_date else "unknown"
     expected_base = f"XRF Sample Report - {sample_name} - {date_str}"
 
-    # Step 1: find any same-date summary result via blob name prefix
+    # Step 1: find any same-date summary result via blob name prefix.
+    # entity_ids server-side filter is unreliable for this schema (isMulti material
+    # field, secondary xrf_sample field). Scan all results and filter in memory.
+    # Prefer matching by FIELD_SUM_XRF_SAMPLE (specific to this replicate) over
+    # FIELD_SUM_SAMPLE (material entity, shared by all replicates) to minimise
+    # false positives and reduce the number of blob API calls needed.
     same_date_summary = None
-    for page in benchling.assay_results.list(
-        schema_id=XRF_SUMMARY_SCHEMA, entity_ids=[entity_id]
-    ):
+    for page in benchling.assay_results.list(schema_id=XRF_SUMMARY_SCHEMA):
         for r in page:
             if not r.fields:
                 continue
-            field = r.fields.additional_properties.get(FIELD_SUM_REPORT)
-            blob_id = getattr(field, "value", None)
-            if not blob_id:
+            fm = r.fields.additional_properties
+            # In-memory entity filter
+            matched = False
+            if xrf_entity_id:
+                xrf_field = fm.get(FIELD_SUM_XRF_SAMPLE)
+                if xrf_field and xrf_field.value == xrf_entity_id:
+                    matched = True
+            if not matched and entity_id:
+                sample_field = fm.get(FIELD_SUM_SAMPLE)
+                if sample_field:
+                    val = sample_field.value
+                    entity_vals = val if isinstance(val, list) else [val]
+                    if entity_id in entity_vals:
+                        matched = True
+            if not matched:
                 continue
-            try:
-                blob = benchling.blobs.get(blob_id)
-                if blob.name and blob.name.startswith(expected_base):
-                    same_date_summary = r
-            except Exception:
+            # Blob name check (only reached for entity-matched results).
+            # Prefer display_value (blob filename returned inline — no API call).
+            # Fall back to blobs.get() only when display_value is absent.
+            field = fm.get(FIELD_SUM_REPORT)
+            if not field:
                 continue
+            blob_name = getattr(field, "display_value", None)
+            if not blob_name:
+                blob_id = getattr(field, "value", None)
+                if not blob_id:
+                    continue
+                try:
+                    blob = benchling.blobs.get(blob_id)
+                    blob_name = blob.name
+                except Exception:
+                    continue
+            if blob_name and blob_name.startswith(expected_base):
+                same_date_summary = r
         if same_date_summary:
             break
 
     if same_date_summary is None:
         return None
 
-    # Step 2: build new measurement  elem_dropdown_id → concentration
+    # Step 2: build new measurement  elem_dropdown_id → concentration.
+    # ELEMENT_FULL_NAMES converts short names ("K") to full names ("Potassium (K)")
+    # which are the keys used in CONC_ELEMENT_IDS.
     new_concs = {}
     for elem, data in processed.items():
-        elem_id = CONC_ELEMENT_IDS.get(elem)
+        elem_id = CONC_ELEMENT_IDS.get(ELEMENT_FULL_NAMES.get(elem, elem))
         if elem_id and data.get("conc") is not None:
             new_concs[elem_id] = float(data["conc"])
 
@@ -889,9 +948,10 @@ def _check_duplicate(benchling, sample_name: str, run_date: str, processed: dict
 
     # Step 3: collect ALL existing concentration values for this entity
     # grouped by element dropdown ID (no timestamp filtering — avoids tz issues)
+    conc_filter_id = xrf_entity_id or entity_id
     existing_by_elem = {}  # elem_dropdown_id → set of float values
     for page in benchling.assay_results.list(
-        schema_id=XRF_CONCENTRATION_SCHEMA, entity_ids=[entity_id]
+        schema_id=XRF_CONCENTRATION_SCHEMA, entity_ids=[conc_filter_id]
     ):
         for r in page:
             if not r.fields:
@@ -920,6 +980,54 @@ def _check_duplicate(benchling, sample_name: str, run_date: str, processed: dict
         "result_id": same_date_summary.id,
         "url": f"{BENCHLING_URL}/assay-results/{same_date_summary.id}",
     }
+
+
+def find_xrf_entity_by_name(benchling, name: str):
+    """Find an existing XRF Sample entity matching the given uploader name.
+
+    Benchling's naming template auto-renames created entities to the format:
+        XRF_Sample-NNN[MaterialNameNoHyphens,sampling_n
+    e.g. "Annealate-291 2" → search fragment "[Annealate291,2"
+         "Annealate-291"   → search fragment "[Annealate291" (no comma)
+    """
+    base_name, replicate_n = _parse_replicate_suffix(name)
+    base_fragment = base_name.replace("-", "")  # "Annealate-291" → "Annealate291"
+    if replicate_n is not None:
+        search_fragment = f"[{base_fragment},{replicate_n}"
+    else:
+        search_fragment = f"[{base_fragment}"
+
+    for page in benchling.custom_entities.list(schema_id=XRF_SAMPLE_ENTITY_SCHEMA, page_size=100):
+        for entity in page:
+            if search_fragment in entity.name:
+                if replicate_n is None and f"[{base_fragment}," in entity.name:
+                    continue  # replicate entity, not the base sample
+                return entity
+    return None
+
+
+def create_xrf_entity(benchling, name: str, sampling_n: int = None,
+                       material_entity_id: str = None) -> str:
+    """
+    Create a new XRF Sample entity named `name` in the XRF folder.
+    If sampling_n is provided it is stored in the sampling number field.
+    If material_entity_id is provided it is stored in the material link field.
+    Returns the new entity ID.
+    """
+    f = {}
+    if material_entity_id is not None:
+        f[XRF_FIELD_MATERIAL] = {"value": material_entity_id}
+    if sampling_n is not None:
+        f[XRF_FIELD_SAMPLING_NUMBER] = {"value": sampling_n}
+    entity = benchling.custom_entities.create(
+        CustomEntityCreate(
+            schema_id=XRF_SAMPLE_ENTITY_SCHEMA,
+            name=name,
+            folder_id=XRF_FOLDER_ID,
+            fields=_fields(f),
+        )
+    )
+    return entity.id
 
 
 def find_entity_by_name(benchling, name: str):
@@ -964,8 +1072,13 @@ def upload_xrf_results(
     run_date: str,
     dry_run: bool = False,
     entity_id: str = None,
+    material_entity_id: str = None,
 ) -> dict:
-    """Upload concentration, signal, and summary results to Benchling."""
+    """Upload concentration, signal, and summary results to Benchling.
+
+    entity_id          — XRF Sample entity (ts_AaxHMSKmtb instance)
+    material_entity_id — base material entity (e.g. Washate-414)
+    """
 
     if dry_run:
         print(f"\n[DRY RUN] Sample: {sample_name}")
@@ -973,8 +1086,10 @@ def upload_xrf_results(
         print(f"  Signal rows        : {len(signal_rows)}")
         print(f"  Report file        : {xlsx_path.name}")
         if entity_id:
-            print(f"  Entity ID          : {entity_id}  (URL shown above during entity resolution)")
-        else:
+            print(f"  XRF Sample entity  : {entity_id}")
+        if material_entity_id:
+            print(f"  Material entity    : {material_entity_id}")
+        if not entity_id:
             print(f"  Entity link        : (none — will block live upload)")
         return {"dry_run": True}
 
@@ -988,11 +1103,14 @@ def upload_xrf_results(
         if quality_id is None:
             continue
         f = {
-            FIELD_CONC_SAMPLE:   {"value": entity_id},
             FIELD_CONC_ELEMENT:  {"value": CONC_ELEMENT_IDS[r["element"]]},
             FIELD_CONC_VALUE:    {"value": r["concentration"]},
             FIELD_CONC_QUALITY:  {"value": quality_id},
         }
+        if material_entity_id:
+            f[FIELD_CONC_SAMPLE] = {"value": material_entity_id}
+        if entity_id:
+            f[FIELD_CONC_XRF_SAMPLE] = {"value": entity_id}
         conc_creates.append(
             AssayResultCreate(
                 schema_id=XRF_CONCENTRATION_SCHEMA,
@@ -1008,10 +1126,13 @@ def upload_xrf_results(
         if elem_id is None:
             continue  # element not in template/dropdown — skip
         f = {
-            FIELD_SIG_SAMPLE:   {"value": [entity_id]},  # isMulti=True
             FIELD_SIG_ELEMENT:  {"value": elem_id},
             FIELD_SIG_VALUE:    {"value": r["signal_intensity"]},
         }
+        if material_entity_id:
+            f[FIELD_SIG_SAMPLE] = {"value": [material_entity_id]}  # isMulti=True
+        if entity_id:
+            f[FIELD_SIG_XRF_SAMPLE] = {"value": entity_id}
         sig_creates.append(
             AssayResultCreate(
                 schema_id=XRF_SIGNAL_SCHEMA,
@@ -1022,9 +1143,12 @@ def upload_xrf_results(
 
     # Summary result
     summary_fields = {
-        FIELD_SUM_SAMPLE:  {"value": [entity_id]},  # isMulti=True
         FIELD_SUM_REPORT:  {"value": blob.id},
     }
+    if material_entity_id:
+        summary_fields[FIELD_SUM_SAMPLE] = {"value": [material_entity_id]}  # isMulti=True
+    if entity_id:
+        summary_fields[FIELD_SUM_XRF_SAMPLE] = {"value": entity_id}
     summary_create = AssayResultCreate(
         schema_id=XRF_SUMMARY_SCHEMA,
         project_id=XRF_PROJECT_ID,
@@ -1064,6 +1188,8 @@ def upload_xrf_from_txt(
     benchling=None,
     dry_run: bool = False,
     entity_map: dict = None,
+    xrf_entity_map: dict = None,
+    xrf_name_overrides: dict = None,
 ) -> list:
     """
     Full pipeline for one .txt file:
@@ -1091,7 +1217,11 @@ def upload_xrf_from_txt(
     print(f"\nParsed '{txt_path.name}'")
     print(f"  Calibration sets      : {len(cal_sets)}"
           f"  ({[sorted(cs.keys()) for cs in cal_sets]})")
-    print(f"  Samples found         : {list(samples.keys())}")
+    sample_rows   = parsed["sample_rows"]
+    unique_names  = list(samples.keys())
+    row_count     = len(sample_rows)
+    extra         = f" ({row_count} total rows, {len(unique_names)} unique)" if row_count != len(unique_names) else ""
+    print(f"  Samples found         : {unique_names}{extra}")
     print(f"  Run date              : {run_date}")
 
     # Calibration-only file → generate comparison report and exit early
@@ -1104,7 +1234,7 @@ def upload_xrf_from_txt(
     calibration = build_calibration(cal_signals)
 
     all_results = []
-    for sample_name, raw_signals in samples.items():
+    for sample_name, raw_signals in sample_rows:
         print(f"\n  Processing: {sample_name}")
         processed = process_sample(raw_signals, calibration)
 
@@ -1113,10 +1243,13 @@ def upload_xrf_from_txt(
             disp = r["display_conc"]
             print(f"    {elem:4s}: {str(disp):>20s}  [{r['quality']}]")
 
-        entity_id = (entity_map or {}).get(sample_name)
+        material_entity_id = (entity_map or {}).get(sample_name)
 
+        pre_resolved_xrf_id = (xrf_entity_map or {}).get(sample_name)
         if benchling is not None:
-            dupe = _check_duplicate(benchling, sample_name, run_date, processed, entity_id=entity_id)
+            dupe = _check_duplicate(benchling, sample_name, run_date, processed,
+                                    entity_id=material_entity_id,
+                                    xrf_entity_id=pre_resolved_xrf_id)
             if dupe:
                 if dry_run:
                     print(f"  [DRY RUN] Existing upload found: {dupe['url']}")
@@ -1133,7 +1266,29 @@ def upload_xrf_from_txt(
         conc_rows, signal_rows = build_benchling_rows(sample_name, processed, raw_signals)
         # Filter signal rows to elements present in the template dropdown
         signal_rows = [r for r in signal_rows if r["element"] in SIG_ELEMENT_IDS]
-        if not dry_run and entity_id is None:
+
+        # Create (or reuse) the XRF Sample entity for this measurement
+        xrf_name = (xrf_name_overrides or {}).get(sample_name, sample_name)
+        _, replicate_n = _parse_replicate_suffix(xrf_name)
+        if not dry_run and benchling is not None:
+            xrf_entity_id = (xrf_entity_map or {}).get(sample_name)
+            if xrf_entity_id is not None:
+                print(f"  Reusing XRF entity: {xrf_entity_id}")
+            else:
+                xrf_entity_id = create_xrf_entity(
+                    benchling, xrf_name,
+                    sampling_n=replicate_n if replicate_n is not None else 0,
+                    material_entity_id=material_entity_id,
+                )
+                print(f"  Created XRF entity: {xrf_entity_id}  (name: '{xrf_name}')")
+                if xrf_entity_map is not None:
+                    xrf_entity_map[sample_name] = xrf_entity_id  # reuse on subsequent occurrences
+            if material_entity_id:
+                print(f"  Material entity   : {material_entity_id}")
+        else:
+            xrf_entity_id = (xrf_entity_map or {}).get(sample_name) or material_entity_id  # fallback for dry-run display
+
+        if not dry_run and xrf_entity_id is None:
             print(f"  Skipping Benchling upload for '{sample_name}' (no entity resolved).")
             all_results.append({"skipped": True, "sample_name": sample_name})
             continue
@@ -1146,7 +1301,8 @@ def upload_xrf_from_txt(
             xlsx_path,
             run_date,
             dry_run=dry_run,
-            entity_id=entity_id,
+            entity_id=xrf_entity_id,
+            material_entity_id=material_entity_id,
         )
         all_results.append(result)
 
