@@ -999,9 +999,13 @@ def find_xrf_entity_by_name(benchling, name: str):
 
     for page in benchling.custom_entities.list(schema_id=XRF_SAMPLE_ENTITY_SCHEMA, page_size=100):
         for entity in page:
+            # Post-registration match: Benchling naming template has renamed the entity
             if search_fragment in entity.name:
                 if replicate_n is None and f"[{base_fragment}," in entity.name:
                     continue  # replicate entity, not the base sample
+                return entity
+            # Pre-registration match: entity created but not yet registered/renamed by template
+            if entity.name == name:
                 return entity
     return None
 
@@ -1012,7 +1016,7 @@ def create_xrf_entity(benchling, name: str, sampling_n: int = None,
     Create a new XRF Sample entity named `name` in the XRF folder.
     If sampling_n is provided it is stored in the sampling number field.
     If material_entity_id is provided it is stored in the material link field.
-    Returns the new entity ID.
+    Returns (entity_id, web_url).
     """
     f = {}
     if material_entity_id is not None:
@@ -1027,7 +1031,7 @@ def create_xrf_entity(benchling, name: str, sampling_n: int = None,
             fields=_fields(f),
         )
     )
-    return entity.id
+    return entity.id, getattr(entity, "web_url", None)
 
 
 def find_entity_by_name(benchling, name: str):
@@ -1270,16 +1274,19 @@ def upload_xrf_from_txt(
         # Create (or reuse) the XRF Sample entity for this measurement
         xrf_name = (xrf_name_overrides or {}).get(sample_name, sample_name)
         _, replicate_n = _parse_replicate_suffix(xrf_name)
+        xrf_entity_created = False
+        xrf_entity_url = None
         if not dry_run and benchling is not None:
             xrf_entity_id = (xrf_entity_map or {}).get(sample_name)
             if xrf_entity_id is not None:
                 print(f"  Reusing XRF entity: {xrf_entity_id}")
             else:
-                xrf_entity_id = create_xrf_entity(
+                xrf_entity_id, xrf_entity_url = create_xrf_entity(
                     benchling, xrf_name,
                     sampling_n=replicate_n if replicate_n is not None else 0,
                     material_entity_id=material_entity_id,
                 )
+                xrf_entity_created = True
                 print(f"  Created XRF entity: {xrf_entity_id}  (name: '{xrf_name}')")
                 if xrf_entity_map is not None:
                     xrf_entity_map[sample_name] = xrf_entity_id  # reuse on subsequent occurrences
@@ -1304,6 +1311,9 @@ def upload_xrf_from_txt(
             entity_id=xrf_entity_id,
             material_entity_id=material_entity_id,
         )
+        result["xrf_entity_id"]      = xrf_entity_id
+        result["xrf_entity_url"]     = xrf_entity_url
+        result["xrf_entity_created"] = xrf_entity_created
         all_results.append(result)
 
     return all_results
